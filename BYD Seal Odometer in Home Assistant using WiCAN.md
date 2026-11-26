@@ -1,244 +1,222 @@
-# BYD Seal odometer in Home Assistant via MeatPi WiCAN OBD (passive CAN filter)
+# BYD Seal and Sealion 6 odometer in Home Assistant using MeatPi WiCAN OBD
 
-This guide reads the odometer from a broadcast CAN frame on a BYD Seal, using the **MeatPi WiCAN OBD** and its **MQTT CAN filter**, and shows it in Home Assistant. It doesn't send any requests to the car, so it runs alongside AutoPID polling (SoC, charge times).
+This guide reads the odometer from a passive CAN broadcast using the **MeatPi WiCAN OBD MQTT CAN filter** and displays it in Home Assistant.
 
-**Status: working and confirmed.** The reading matched the dashboard when parked, and it incremented correctly on a drive.
+The odometer filter does **not** send a diagnostic request to the car. It can run alongside the WiCAN's AutoPID vehicle profile, which I use for battery state of charge.
 
-**Tested on:**
-- BYD Seal, 2024 model, Australia
-- MeatPi WiCAN OBD, firmware **4.21**
-- Home Assistant with an MQTT broker (Mosquitto), checked with MQTT Explorer
+## Tested vehicles
 
-Other Seal years, markets, or software versions may use a different frame ID or byte layout. Check the Monitor tab on yours before you copy the settings.
+This method has been tested on:
 
----
+- **2024 BYD Seal**, Australia
+- **2024 BYD Sealion 6**, Australia
+- Original **MeatPi WiCAN OBD**, firmware **4.21**
+
+On both vehicles, the decoded reading matched the dashboard. The Seal reading was also confirmed to increment during a drive. Other model years, markets or vehicle software versions may differ, so compare the result with your own dashboard.
 
 ## What you need
 
-- A MeatPi WiCAN OBD, connected to the car's OBD port
-- WiCAN on your network (AP+Station mode) with MQTT enabled
-- An MQTT broker that Home Assistant also uses
-- MQTT Explorer (or `mosquitto_sub`) to check the topics
-- Your dashboard odometer reading, to compare against
+- A MeatPi WiCAN OBD connected to the car
+- WiCAN connected to your network in **AP+Station** mode
+- An MQTT broker accessible to both WiCAN and Home Assistant
+- The MQTT integration configured in Home Assistant
+- Optionally, MQTT Explorer to inspect messages
+- Your car's dashboard odometer reading for comparison
 
-For SoC, I use the built-in vehicle-specific profile. In the WiCAN web UI, set **Protocol** to **AutoPID**, then on the **Automate** tab enable **Vehicle Specific** and choose **BYD: Seal**. That profile already includes SoC, so you don't need to add it yourself.
+I use WiCAN's **AutoPID** mode with the vehicle-specific profile **BYD: Seal**, which already provides SoC. The odometer uses the separate MQTT CAN filter described below.
 
----
+> **Before you start:** Note your existing WiCAN settings. On some vehicles, active AutoPID polling while the car is locked can trigger the alarm. The odometer filter itself listens to a broadcast and does not send a request.
 
-## Step 1: Find the odometer frame
+## 1. Find the odometer frame
 
-In the WiCAN web UI, open the **Monitor** tab with the car awake. Look for frame **`3D9h`** (decimal **985**). A sample looked like this:
+With the car awake, open the WiCAN web interface and go to **Monitor**. Look for CAN ID **`3D9h`**, which is **985 in decimal**.
 
-```
+A sample from the Sealion 6:
+
+```text
 ID    Data
-3D9h  05 1F D9 03 F8 FF 47 2E
+3D9h  05 EC 7C 03 70 00 47 6E
 ```
 
-The odometer is in **bytes 1 to 3**, as a 24-bit little-endian value in tenths of a km:
+The odometer is in **bytes 1–3**, counting the first byte as byte 0:
 
-| Byte | Example | Role |
+| Byte | Sample | Meaning |
 |---|---|---|
-| 0 | `05` | Status/sequence (not used) |
-| 1 | `1F` | Odometer, low byte |
-| 2 | `D9` | Odometer, middle byte |
-| 3 | `03` | Odometer, high byte |
-| 4–6 | `F8 FF 47` | Not used here |
-| 7 | `2E` | Rolling counter or checksum (not used) |
+| 0 | `05` | Observed as `05` so far; purpose unknown |
+| 1 | `EC` | Odometer low byte |
+| 2 | `7C` | Odometer middle byte |
+| 3 | `03` | Odometer high byte |
+| 4–6 | `70 00 47` | Not used for this calculation |
+| 7 | `6E` | Changes between frames; purpose unknown |
 
-Decoding: `0x03D91F` = 252,191, so 252,191 / 10 = **25,219.1 km**.
+The three odometer bytes are **little-endian** and represent tenths of a kilometre. In this example, `EC 7C 03` decodes to **22,858.8 km**.
 
-> If you don't see `3D9h`, check the car is awake (ignition on, or charging), and that the Monitor is running at 500 kbit/s.
+If you don't see `3D9h`, make sure the car is awake and the monitor is running at the correct bus speed; the tested setup used **500K**.
 
----
+## 2. Configure MQTT on WiCAN
 
-## Step 2: Add three rows to the MQTT CAN filter
+In the WiCAN web interface:
 
-Under the **MQTT** card on the WiCAN, enable MQTT and fill in the broker address and port. Then add three rows to the **CAN filter** table, one per byte:
+1. Under **Settings → CAN**, enable **MQTT**.
+2. In the MQTT card, enter your broker address, port and credentials.
+3. Make sure the **RX topic** is enabled.
+4. Check that WiCAN is connected to your network in **AP+Station** mode.
 
-| Name | CAN ID (dec) | PID | Index | Start Bit | Bit Length | Expression | Cycle ms |
-|---|---|---|---|---|---|---|---|
-| `ODO_B1` | 985 | -1 | 2 | 8 | 8 | `V` | 1000 |
-| `ODO_B2` | 985 | -1 | 2 | 16 | 8 | `V` | 1000 |
-| `ODO_B3` | 985 | -1 | 2 | 24 | 8 | `V` | 1000 |
+The WiCAN documentation says Bluetooth LE and MQTT cannot run together, so disable BLE if necessary.
 
-- **CAN ID 985** is `0x3D9` in decimal.
-- **PID -1** marks it as a non-OBD frame. The Index value is ignored.
-- **Start Bit** counts from the first data byte, so byte 1 starts at bit 8, byte 2 at 16, byte 3 at 24.
+See the [MeatPi MQTT documentation](https://docs.meatpi.com/wican-obd/send-data/mqtt/) for the current settings and limitations.
 
-Click **Add ID** for each row, then **Store**, then **Submit Changes**. WiCAN restarts.
+## 3. Add one MQTT CAN filter
 
-This runs alongside AutoPID, so SoC and charge times keep working.
+In the **MQTT CAN filter** table, add this single row:
 
----
+| Field | Value |
+|---|---|
+| CAN ID (dec) | `985` |
+| Name | `ODO_RAW` |
+| PID | `-1` |
+| Index | `2` |
+| Start Bit | `8` |
+| Bit Length | `24` |
+| Expression | `V` |
+| Cycle ms | `10000` |
 
-## Step 3: Check the topic in MQTT Explorer
+Then click **Add ID**, **Store**, and **Submit Changes**. WiCAN restarts to apply the filter.
 
-After the restart, each rule publishes to the RX topic:
+> **Note:** Once a CAN filter exists, WiCAN publishes filter values instead of unfiltered raw frames on the RX topic. This may affect any other consumers that rely on raw frames. AutoPID remained in use alongside the filter in the tested setup.
 
+## 4. Find your MQTT topic
+
+Open MQTT Explorer and look for the WiCAN topic tree. The default RX topic has this form:
+
+```text
+wican/<YOUR_WICAN_ID>/can/rx
 ```
-wican/dc067519eb01/can/rx
+
+For example, if your device ID were `example123`, the topic would be:
+
+```text
+wican/example123/can/rx
 ```
 
-The payload is one key per message:
+Find your actual device ID in the WiCAN web interface or its Home Assistant device information. You can also find the exact topic directly in MQTT Explorer under:
+
+```text
+wican → <YOUR_WICAN_ID> → can → rx
+```
+
+**Use the topic shown by your own device**, because topics can be renamed.
+
+You should see messages such as:
 
 ```json
-{"ODO_B1": 31}
-{"ODO_B2": 217}
-{"ODO_B3": 3}
+{"ODO_RAW": 15498243.000000}
 ```
 
-Replace `dc067519eb01` with your own device ID, which appears in the topic. The device ID matched the serial number shown in the WiCAN device info.
+For the sample `EC 7C 03`, `15498243` is the three-byte field as WiCAN extracted it. Home Assistant will rearrange the bytes to obtain the odometer.
 
----
+## 5. Add the raw MQTT sensor to Home Assistant
 
-## Step 4: MQTT sensors in Home Assistant
-
-Each message carries one key, so each sensor has to keep its last value when its key is missing. Otherwise the other two sensors go to *unknown* on every message, and the odometer never calculates.
-
-Add this to `configuration.yaml`, or to a package file if you use packages:
+Edit `/config/configuration.yaml` and add the following. Replace `<YOUR_WICAN_ID>` with your actual device ID, or replace the entire `state_topic` with the topic you found in MQTT Explorer.
 
 ```yaml
 mqtt:
   sensor:
-    - name: "ODO_B1"
-      state_topic: "wican/dc067519eb01/can/rx"
+    - name: "BYD Odometer Raw"
+      unique_id: byd_odometer_raw
+      state_topic: "wican/<YOUR_WICAN_ID>/can/rx"
       value_template: >-
-        {% if value_json.ODO_B1 is defined %}{{ value_json.ODO_B1 }}{% else %}{{ states('sensor.odo_b1') }}{% endif %}
-    - name: "ODO_B2"
-      state_topic: "wican/dc067519eb01/can/rx"
-      value_template: >-
-        {% if value_json.ODO_B2 is defined %}{{ value_json.ODO_B2 }}{% else %}{{ states('sensor.odo_b2') }}{% endif %}
-    - name: "ODO_B3"
-      state_topic: "wican/dc067519eb01/can/rx"
-      value_template: >-
-        {% if value_json.ODO_B3 is defined %}{{ value_json.ODO_B3 }}{% else %}{{ states('sensor.odo_b3') }}{% endif %}
+        {% if value_json.ODO_RAW is defined %}
+          {{ value_json.ODO_RAW }}
+        {% else %}
+          {{ this.state }}
+        {% endif %}
 ```
 
-Check the config under **Developer Tools → YAML**, then restart Home Assistant. Check the entity IDs under **Developer Tools → States**. If the names are different, update the `states()` calls to match.
+If `configuration.yaml` already contains an `mqtt:` section, add the sensor to its existing `sensor:` list rather than creating a second `mqtt:` key. Alternatively, put the configuration in a Home Assistant package if you use packages.
 
----
+The template retains the sensor's previous value when another message on the same topic does not contain `ODO_RAW`.
 
-## Step 5: Combine the bytes into the odometer
+Check the configuration in **Developer Tools → YAML**, then reload MQTT entities if available or restart Home Assistant.
 
-You can create this as a **template sensor** in the UI, which lets you link it to the Seal device. Go to **Settings → Devices & services → Helpers → Create helper → Template → Template a sensor**, then enter:
+In **Developer Tools → States**, check the entity ID Home Assistant created. The template below assumes:
 
-**State template**
+```text
+sensor.byd_odometer_raw
+```
+
+If HA assigned a different ID, use that ID in the template.
+
+## 6. Create the odometer template sensor
+
+Create a template sensor in the Home Assistant UI:
+
+**Settings → Devices & services → Helpers → Create helper → Template → Template a sensor**
+
+Paste this into the **State** field:
 
 ```jinja
-{% set b1 = states('sensor.odo_b1') | float(none) %}
-{% set b2 = states('sensor.odo_b2') | float(none) %}
-{% set b3 = states('sensor.odo_b3') | float(none) %}
-{% if b1 is none or b2 is none or b3 is none %}
+{% set raw = states('sensor.byd_odometer_raw') | float(none) %}
+{% if raw is none %}
   {{ none }}
 {% else %}
-  {{ (((b3 * 65536) + (b2 * 256) + b1) / 10) | round(1) }}
+  {% set v = raw | int %}
+  {% set b1 = (v // 65536) % 256 %}
+  {% set b2 = (v // 256) % 256 %}
+  {% set b3 = v % 256 %}
+  {{ ((b3 * 65536 + b2 * 256 + b1) / 10) | round(1) }}
 {% endif %}
 ```
 
-**Settings**
+Set the remaining fields to:
 
-- Device class: **Distance**
-- State class: **Total increasing**
-- Unit of measurement: **km**
-- Device: your WiCAN device (the "Seal" device in my case)
+- **Name:** `Odometer` or `BYD Odometer`
+- **Device class:** `Distance`
+- **Unit of measurement:** `km`
+- **Device:** select your WiCAN/car device
 
-The preview should show about **25,219.1 km**. Then submit, and rename the entity if you want.
+Leave the **state class** unset while testing. Once you have confirmed the value is stable and increases correctly, you can select **Total increasing**.
 
-If you'd rather use YAML, put this under `template:` in the same file:
+The preview should show a value close to the dashboard odometer. Submit the helper to create it.
 
-```yaml
-template:
-  - sensor:
-      - name: "Seal Odometer"
-        unit_of_measurement: "km"
-        device_class: distance
-        state_class: total_increasing
-        state: >-
-          {% set b1 = states('sensor.odo_b1') | float(none) %}
-          {% set b2 = states('sensor.odo_b2') | float(none) %}
-          {% set b3 = states('sensor.odo_b3') | float(none) %}
-          {% if b1 is none or b2 is none or b3 is none %}
-            {{ none }}
-          {% else %}
-            {{ (((b3 * 65536) + (b2 * 256) + b1) / 10) | round(1) }}
-          {% endif %}
-```
+## 7. Verify the result
 
-The guard returns unknown instead of a wrong number when any byte is missing. A low number would break `total_increasing` statistics.
+1. Compare the Home Assistant reading with the dashboard while parked.
+2. Drive a known distance and check that the sensor increases accordingly.
+3. Check it again after the car sleeps and wakes.
 
----
+The tested car's app/dashboard appeared to **truncate** the decimal part rather than round it. For example, a reading of `22,858.8 km` was displayed as `22,858 km`.
 
-## Step 6: Verify
-
-1. With the car parked, check the odometer sensor shows about **25,219.1 km**.
-2. Check the three byte sensors update in the Activity log, and the odometer doesn't go to *unknown* between updates.
-3. Drive and check the reading rises as you go. This was confirmed on a drive test.
-
-### Truncated vs rounded values
-
-The car's app and dashboard **truncate** to whole km, so 25,219.9 km shows as 25,219. The HA sensor rounds to one decimal place, so it shows 25,219.9. Both values come from the same reading. The difference is always less than 1 km.
-
-If you want the HA value to match the car's display, you can change the template's final line to:
+If you prefer whole kilometres in Home Assistant, replace the final calculation in the template with:
 
 ```jinja
-{{ (((b3 * 65536) + (b2 * 256) + b1) / 10) | int }}
+{{ ((b3 * 65536 + b2 * 256 + b1) / 10) | int }}
 ```
 
-Keep the decimal version if you want to see tenths of a km while you drive.
-
----
+The decimal version retains the extra resolution.
 
 ## Troubleshooting
 
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| Byte sensors show *unknown* | `value_json` key missing from the message | Use the sensor templates above, which keep the last value |
-| Odometer shows *unknown* | One byte sensor hasn't received a value yet | Wait a few seconds after restart. Check the Activity log |
-| Nothing in MQTT Explorer | RX checkbox off, car asleep, or the filter wasn't stored | Check the RX option, wake the car, and re-check **Store** / **Submit Changes** |
-| Value is off by a multiple of 65,536 | Bytes read in the wrong order | Check the expression is `((B3*65536)+(B2*256)+B1)/10` |
-| Value is 10× too large or small | Missing `/10`, or the expression is in the wrong units | Check the value is about 25,219 km, not 252,191 |
-| Entity IDs don't match | HA created different names | Check the entity IDs in Developer Tools → States and update the `states()` calls |
+| Problem | What to check |
+|---|---|
+| No `3D9h` frame | Wake the car, check the monitor and bus speed |
+| No MQTT messages | Check broker connection, RX topic, filter settings, Store and Submit |
+| `ODO_RAW` remains unknown | Check the exact MQTT topic and that the message contains `ODO_RAW` |
+| Odometer template remains unknown | Check the raw sensor's actual entity ID |
+| Reading is wrong | Check Start Bit `8`, Bit Length `24`, expression `V`, and the template byte order |
+| Reading doesn't update | Check the car is broadcasting and that the filter cycle was accepted |
+| SoC or other data stops updating | Check AutoPID and existing MQTT consumers after adding the filter |
 
----
+### Stale readings
 
-## Caveats
-
-- **One car tested.** This is a 2024 Seal in Australia on firmware 4.21 of the WiCAN OBD. Other years, markets, or software versions may use a different frame.
-- **Byte 0 and byte 7 are not used.** They change between samples, so they're likely a status byte and a rolling counter.
-- **Check after car updates.** BYD software updates could change the frame, so check the reading after an update.
-
----
+The sensor holds its last value when the car is asleep or out of Wi-Fi range. A displayed number therefore doesn't necessarily mean the car is currently reporting. Check WiCAN connectivity or a separate last-update indicator if freshness matters.
 
 ## What didn't work
 
-For anyone searching later, I tried the odometer combinations suggested in the forum posts and OBD PID lists, and **none of them returned the correct odometer** on my Seal:
+Before using the passive CAN frame, I tried the suggested diagnostic odometer requests, including:
 
-- **`22DD01` on `7E4`** (the request from the BYD post). Read as 2-byte or 3-byte, big- or little-endian, with and without `/10` and the miles conversion. The closest result was 9,776, and the 3-byte value was 58,038,048. Neither matched 25,219.
-- **`220026` on `743`** (OBDb `BYD_ODO`, 24-bit little-endian in tenths of a km). No usable response with the header tested.
-- **`222143` and `22210A` on `7E0`** (OBDb instrument-panel and engine total mileage). No usable response.
-- **Car Scanner.** No BYD Seal profile shows the odometer.
+- `22DD01` on `7E4`
+- `220026` on `743`
+- `222143` and `22210A` on `7E0`
 
-The passive broadcast frame was the only route that worked for me.
-
----
-
-## Bonus: Charge times (AutoPID custom PID)
-
-The vehicle-specific `BYD: Seal` profile covers SoC but not charge times, so I added charge times as a custom PID. It's the BYD charge counter, based on the BYD Atto 3 data in the OBDb project. It shows up as **ChargeTimes** on the WiCAN device, and on my Seal it reads 1,402.
-
-1. In the WiCAN web UI, go to the **Automate** tab and scroll to **Custom PIDs**.
-2. Click **New** and enter these values:
-
-| Field | Value |
-|---|---|
-| Name | `ChargeTimes` |
-| Init | `ATSH7E7;` (keep the trailing `;`) |
-| PID | `22000B1` |
-| Expression | `(B5*256)+B4` |
-| Min Value | `0` |
-| Max Value | `65535` |
-| Period (ms) | `60000` |
-
-3. Click **Store**, then **Submit Changes**.
-
-The `1` at the end of the PID requests a single-frame reply. The expression reads the two bytes little-endian. Charge times only changes when you charge, so a 60-second period is plenty.
+None produced the correct odometer on the tested cars. Car Scanner profiles also did not show the Seal odometer. The `3D9h` broadcast worked without needing an odometer DID.
